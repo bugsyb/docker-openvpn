@@ -1,6 +1,6 @@
 # Modifications to OpenVPN for Docker
 
-Allowing integration with OpenVPN-web-ui and using latest version of OpenVPN on ARMv8
+Allowing integration with OpenVPN-web-ui and using latest version of OpenVPN on ARMv8.
 
 
 
