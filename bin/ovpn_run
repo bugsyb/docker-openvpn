@@ -8,7 +8,8 @@ if [ "$DEBUG" == "1" ]; then
   set -x
 fi
 
-set -e
+# Don't really want to exit if anything fails, i.e. DNS resolv in commands there
+# set -e
 
 cd $OPENVPN
 
@@ -39,16 +40,43 @@ function addArg {
 # this allows rules/routing to be altered by supplying this function
 # in an included file, such as ovpn_env.sh
 function setupIptablesAndRouting {
-    iptables -t nat -C POSTROUTING -s $OVPN_SERVER -o $OVPN_NATDEVICE -j MASQUERADE 2>/dev/null || {
+    iptables -t nat -C POSTROUTING -s $OVPN_SERVER -o $OVPN_NATDEVICE -j MASQUERADE || {
       iptables -t nat -A POSTROUTING -s $OVPN_SERVER -o $OVPN_NATDEVICE -j MASQUERADE
     }
     for i in "${OVPN_ROUTES[@]}"; do
-        iptables -t nat -C POSTROUTING -s "$i" -o $OVPN_NATDEVICE -j MASQUERADE 2>/dev/null || {
+        iptables -t nat -C POSTROUTING -s "$i" -o $OVPN_NATDEVICE -j MASQUERADE || {
           iptables -t nat -A POSTROUTING -s "$i" -o $OVPN_NATDEVICE -j MASQUERADE
         }
     done
 }
 
+# set up iptables rules for Management access 
+# - to limit it only to/from openvpn-ui (docker host)
+function setupIptablesManagementAccess {
+    iptables -t nat -A PREROUTING -s openvpn-ui -d openvpn -p tcp --dport 2080 -j DNAT --to 127.0.0.1
+    iptables -A INPUT -s openvpn-ui -d 127.0.0.1 -p tcp --dport 2080 -j ACCEPT
+    iptables -t nat -A PREROUTING -s openvpn-ui-dev -d openvpn -p tcp --dport 2080 -j DNAT --to 127.0.0.1
+    iptables -A INPUT -s openvpn-ui-dev -d 127.0.0.1 -p tcp --dport 2080 -j ACCEPT
+    iptables -A INPUT -d 127.0.0.1 -p tcp --dport 2080 -j DROP
+    iptables -A INPUT -p tcp --dport 2080 -j DROP
+}
+
+function waitForPkiConfiguration {
+    echo "Awaiting for PKI to be provisioned by OpenVPN-UI sibling"
+    while [ ! -f "$OPENVPN/.provisioned" ]; 
+    do
+	echo -n "."
+	sleep 2
+    done
+    if [ ! -f $EASYRSA_PKI/ta.key ]; then 
+      echo ""
+      echo "Creating ta.key"
+      openvpn --genkey --secret $EASYRSA_PKI/ta.key
+      echo "TA.KEY created"
+    fi
+}
+
+waitForPkiConfiguration
 
 addArg "--config" "$OPENVPN/openvpn.conf"
 
@@ -87,19 +115,17 @@ fi
 
 ip -6 route show default 2>/dev/null
 if [ $? = 0 ]; then
-    echo "Checking IPv6 Forwarding"
-    if [ "$(</proc/sys/net/ipv6/conf/all/disable_ipv6)" != "0" ]; then
-        echo "Sysctl error for disable_ipv6, please run docker with '--sysctl net.ipv6.conf.all.disable_ipv6=0'"
-    fi
+    echo "Enabling IPv6 Forwarding"
+    # If this fails, ensure the docker container is run with --privileged
+    # Could be side stepped with `ip netns` madness to drop privileged flag
 
-    if [ "$(</proc/sys/net/ipv6/conf/default/forwarding)" != "1" ]; then
-        echo "Sysctl error for default forwarding, please run docker with '--sysctl net.ipv6.conf.default.forwarding=1'"
-    fi
-
-    if [ "$(</proc/sys/net/ipv6/conf/all/forwarding)" != "1" ]; then
-        echo "Sysctl error for all forwarding, please run docker with '--sysctl net.ipv6.conf.all.forwarding=1'"
-    fi
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 || echo "Failed to enable IPv6 support"
+    sysctl -w net.ipv6.conf.default.forwarding=1 || echo "Failed to enable IPv6 Forwarding default"
+    sysctl -w net.ipv6.conf.all.forwarding=1 || echo "Failed to enable IPv6 Forwarding"
 fi
+
+echo "Adding required access & NAT rules to allow access to MGMT interface only from dedicated system"
+setupIptablesManagementAccess
 
 echo "Running 'openvpn ${ARGS[@]} ${USER_ARGS[@]}'"
 exec openvpn ${ARGS[@]} ${USER_ARGS[@]}
